@@ -1,0 +1,440 @@
+// Options Lens UI. All math lives in bs.js and strategy.js; this file only
+// reads inputs, calls them, and draws SVG charts by hand (no libraries).
+import { DAYS_PER_YEAR, bsmPrice, bsmGreeks, impliedVol, putCallParity } from './bs.js';
+import { makeLeg, expiryPnL, todayPnL, netGreeks, analyze, sampleCurve, PRESETS, presetLegs } from './strategy.js';
+
+const DEFAULTS = { S: 100, K: 100, sigma: 0.2, r: 0.05, q: 0, days: 90, type: 'call', ivPrice: 5, preset: 'bull-call-spread', greek: 'delta' };
+const state = { ...DEFAULTS, legs: [] };
+const topFields = [];
+
+const $ = (id) => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const mkt = () => ({ S: state.S, r: state.r, q: state.q, sigma: state.sigma, T: state.days / DAYS_PER_YEAR });
+const optPrice = (leg, S) => (leg.type === 'stock' ? S : bsmPrice({ ...mkt(), S, K: leg.strike }, leg.type));
+
+const fix = (x, d = 2) => {
+  const s = x.toFixed(d);
+  return /^-0(\.0*)?$/.test(s) ? s.slice(1) : s;
+};
+const money = (x, d = 2) => (fix(x, d)[0] === '-' ? '-$' : '$') + Math.abs(x).toFixed(d);
+const smoney = (x, d = 2) => (fix(x, d)[0] === '-' ? '-$' : '+$') + Math.abs(x).toFixed(d);
+
+/* ---------- Inputs: a number box and a slider that stay in sync ---------- */
+
+function makeField(host, o) {
+  const { id, label, min, max, step, get, set, scale = 1, dec = 2, unit = '', prefix = '' } = o;
+  host.insertAdjacentHTML('beforeend',
+    `<div class="field"><div class="field-head"><label for="n-${id}">${label}</label>` +
+    `<span class="num">${prefix}<input id="n-${id}" type="number" inputmode="decimal" min="${min}" max="${max}" step="${step}">${unit}</span></div>` +
+    `<input id="r-${id}" type="range" min="${min}" max="${max}" step="${step}" aria-label="${label}, slider"></div>`);
+  const num = $(`n-${id}`);
+  const rng = $(`r-${id}`);
+  const show = () => {
+    const v = Number((get() * scale).toFixed(dec));
+    num.value = v;
+    rng.value = v;
+  };
+  rng.addEventListener('input', () => {
+    set(rng.valueAsNumber / scale);
+    num.value = Number(rng.valueAsNumber.toFixed(dec));
+    update();
+  });
+  num.addEventListener('input', () => {
+    if (!Number.isFinite(num.valueAsNumber)) return;
+    const v = clamp(num.valueAsNumber, min, max);
+    rng.value = v;
+    set(v / scale);
+    update();
+  });
+  num.addEventListener('change', show);
+  show();
+  return { show };
+}
+
+/* ---------- Hand-drawn SVG charts ---------- */
+
+function niceTicks(lo, hi, n = 5) {
+  const raw = (hi - lo) / n;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const f = raw / mag;
+  const step = (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * mag;
+  const ticks = [];
+  for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + step * 1e-9; v += step) ticks.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  return { ticks, dec: clamp(-Math.floor(Math.log10(step) + 1e-9), 0, 6) };
+}
+
+/**
+ * cfg: { x: [lo, hi], series: [{ cls, f, n, extra }], fillIdx, vlines, dots,
+ *        readout(x), defaultX, label }
+ */
+function drawChart(el, cfg) {
+  el._cfg = cfg;
+  const W = Math.max(el.clientWidth, 260);
+  const H = W < 520 ? 250 : 320;
+  const m = { l: 58, r: 16, t: 16, b: 30 };
+  const [x0, x1] = cfg.x;
+  const curves = cfg.series.map((s) => sampleCurve(s.f, x0, x1, s.n || 160, s.extra || []));
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const c of curves) for (const p of c) { lo = Math.min(lo, p.y); hi = Math.max(hi, p.y); }
+  if (cfg.zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+  const X = (x) => m.l + ((x - x0) / (x1 - x0)) * (W - m.l - m.r);
+  const Y = (y) => H - m.b - ((y - lo) / (hi - lo)) * (H - m.t - m.b);
+  el._geom = { m, W, X, x0, x1, Y };
+
+  const yt = niceTicks(lo, hi, H < 300 ? 4 : 5);
+  const xt = niceTicks(x0, x1, W < 520 ? 4 : 7);
+  let g = '';
+  for (const v of yt.ticks) g += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/><text x="${m.l - 8}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${v.toFixed(yt.dec)}</text>`;
+  for (const v of xt.ticks) g += `<line class="grid" x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/><text x="${X(v).toFixed(1)}" y="${H - 9}" text-anchor="middle">${v.toFixed(xt.dec)}</text>`;
+  g += `<line class="axis" x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}"/>`;
+
+  const path = (c) => c.map((p, i) => `${i ? 'L' : 'M'}${X(p.x).toFixed(1)} ${Y(p.y).toFixed(1)}`).join('');
+  const zeroY = clamp(Y(0), m.t, H - m.b);
+  if (cfg.fillIdx >= 0) {
+    const c = curves[cfg.fillIdx];
+    const area = `${path(c)}L${X(x1).toFixed(1)} ${zeroY.toFixed(1)}L${X(x0).toFixed(1)} ${zeroY.toFixed(1)}Z`;
+    const id = el.id;
+    g += `<defs><clipPath id="${id}-up"><rect x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${Math.max(0, zeroY - m.t).toFixed(1)}"/></clipPath>` +
+      `<clipPath id="${id}-dn"><rect x="${m.l}" y="${zeroY.toFixed(1)}" width="${W - m.l - m.r}" height="${Math.max(0, H - m.b - zeroY).toFixed(1)}"/></clipPath></defs>` +
+      `<path class="fill-pos" d="${area}" clip-path="url(#${id}-up)"/><path class="fill-neg" d="${area}" clip-path="url(#${id}-dn)"/>`;
+  }
+  if (lo < 0 && hi > 0) g += `<line class="zero" x1="${m.l}" x2="${W - m.r}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}"/>`;
+  for (const v of cfg.vlines || []) {
+    if (v.x < x0 || v.x > x1) continue;
+    g += `<line class="${v.cls}" x1="${X(v.x).toFixed(1)}" x2="${X(v.x).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/>`;
+    if (v.label) {
+      const right = X(v.x) > W - m.r - 50;
+      g += `<text class="m-label" x="${(X(v.x) + (right ? -5 : 5)).toFixed(1)}" y="${m.t + 11}" text-anchor="${right ? 'end' : 'start'}">${v.label}</text>`;
+    }
+  }
+  cfg.series.forEach((s, i) => { g += `<path class="${s.cls}" d="${path(curves[i])}"/>`; });
+  for (const d of cfg.dots || []) if (d.x >= x0 && d.x <= x1) g += `<circle class="be" cx="${X(d.x).toFixed(1)}" cy="${Y(d.y).toFixed(1)}" r="5"/>`;
+  g += `<g class="cursor" visibility="hidden"><line class="xh" y1="${m.t}" y2="${H - m.b}"/>` +
+    cfg.series.map((s) => `<circle class="dot-${s.cls.slice(2)}" r="4.5"/>`).join('') + '</g>';
+
+  el.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${g}</svg>`;
+  if (cfg.label) el.setAttribute('aria-label', cfg.label);
+  showAt(el, el._cx != null && el._cx >= x0 && el._cx <= x1 ? el._cx : null);
+}
+
+function showAt(el, x) {
+  const cfg = el._cfg;
+  const { X, Y, x0, x1 } = el._geom;
+  const live = x != null;
+  const cx = clamp(live ? x : cfg.defaultX, x0, x1);
+  const cur = el.querySelector('.cursor');
+  if (cur) {
+    cur.setAttribute('visibility', 'visible');
+    const line = cur.querySelector('line');
+    line.setAttribute('x1', X(cx));
+    line.setAttribute('x2', X(cx));
+    cur.querySelectorAll('circle').forEach((c, i) => {
+      c.setAttribute('cx', X(cx));
+      c.setAttribute('cy', Y(cfg.series[i].f(cx)));
+    });
+  }
+  el._cx = live ? cx : null;
+  $(el.dataset.readout).textContent = cfg.readout(cx);
+}
+
+function initChart(el) {
+  const at = (e) => {
+    const g = el._geom;
+    const px = e.clientX - el.getBoundingClientRect().left;
+    return g.x0 + ((px - g.m.l) / (g.W - g.m.l - g.m.r)) * (g.x1 - g.x0);
+  };
+  el.addEventListener('pointermove', (e) => el._cfg && showAt(el, at(e)));
+  el.addEventListener('pointerdown', (e) => el._cfg && showAt(el, at(e)));
+  el.addEventListener('pointerleave', () => el._cfg && showAt(el, null));
+  el.addEventListener('keydown', (e) => {
+    const g = el._geom;
+    if (!g) return;
+    const unit = (g.x1 - g.x0) / 100;
+    const cur = el._cx != null ? el._cx : el._cfg.defaultX;
+    const moves = { ArrowLeft: cur - unit * (e.shiftKey ? 10 : 1), ArrowRight: cur + unit * (e.shiftKey ? 10 : 1), Home: g.x0, End: g.x1 };
+    if (!(e.key in moves)) return;
+    e.preventDefault();
+    showAt(el, moves[e.key]);
+  });
+  el.addEventListener('blur', () => el._cfg && showAt(el, null));
+}
+
+/* ---------- Section 1: price, Greeks, parity ---------- */
+
+const GREEKS = [
+  { k: 'delta', name: 'Delta', unit: 'per $1 of spot', dec: 3,
+    say: (v) => `If spot rises $1, the price moves about ${smoney(v, 3)}. Calls run from 0 to 1, puts from -1 to 0.` },
+  { k: 'gamma', name: 'Gamma', unit: 'delta per $1', dec: 4,
+    say: (v) => `Delta itself shifts by about ${v.toFixed(4)} for each $1 move. Biggest at the strike and close to expiry.` },
+  { k: 'vega', name: 'Vega', unit: 'per vol point', dec: 3,
+    say: (v) => `If volatility rises one point (say 20% to 21%), the price moves about ${smoney(v, 3)}.` },
+  { k: 'theta', name: 'Theta', unit: 'per day', dec: 3,
+    say: (v) => `With nothing else changing, one more day passing changes the value by about ${smoney(v, 3)}.` },
+  { k: 'rho', name: 'Rho', unit: 'per rate point', dec: 3,
+    say: (v) => `If interest rates rise one point, the price moves about ${smoney(v, 3)}. Usually the smallest effect.` },
+];
+
+function renderPricer() {
+  const p = { ...mkt(), K: state.K };
+  const isCall = state.type === 'call';
+  const px = bsmPrice(p, state.type);
+  const intr = Math.max(isCall ? p.S - p.K : p.K - p.S, 0);
+  $('price-label').textContent = `European ${state.type}, strike ${state.K}`;
+  $('price-main').textContent = money(px);
+  $('price-call').textContent = money(bsmPrice(p, 'call'));
+  $('price-put').textContent = money(bsmPrice(p, 'put'));
+  $('price-intr').textContent = money(intr);
+  $('price-time').textContent = money(px - intr);
+
+  const g = bsmGreeks(p, state.type);
+  $('greeks').innerHTML = GREEKS.map((d) =>
+    `<div class="greek"><dt>${d.name}<small>${d.unit}</small></dt><dd><span class="v">${fix(g[d.k], d.dec)}</span>${d.say(g[d.k])}</dd></div>`).join('');
+
+  const gr = GREEKS.find((d) => d.k === state.greek);
+  const value = (S) => bsmGreeks({ ...p, S }, state.type)[gr.k];
+  drawChart($('chart-greek'), {
+    x: [Math.max(1, Math.min(0.5 * state.K, 0.8 * state.S)), Math.max(1.5 * state.K, 1.2 * state.S)],
+    series: [{ cls: 's-greek', f: value }],
+    fillIdx: -1,
+    vlines: [{ x: state.S, cls: 'm-spot', label: 'Spot' }, { x: state.K, cls: 'm-strike' }],
+    defaultX: state.S,
+    readout: (x) => `Spot ${x.toFixed(2)}: ${gr.name.toLowerCase()} ${fix(value(x), gr.dec)} (${state.type}, strike ${state.K}, dashed line)`,
+    label: `${gr.name} of a ${state.type} option versus spot price. Strike ${state.K}.`,
+  });
+
+  const pc = putCallParity(p);
+  const holds = Math.abs(pc.diff) < 1e-9;
+  $('parity').innerHTML =
+    `<div class="side"><span>Call - Put</span><b>${pc.call.toFixed(4)} - ${pc.put.toFixed(4)} = ${fix(pc.lhs, 4)}</b></div>` +
+    `<div class="side"><span>S e^(-qT) - K e^(-rT)</span><b>${fix(pc.rhs, 4)}</b></div>` +
+    `<p class="verdict">${holds ? '<span class="ok">Parity holds.</span>' : 'Parity gap.'} The sides differ by ${pc.diff.toExponential(1)}` +
+    `${holds ? ', which is just floating-point rounding. In a real market a bigger gap would be an arbitrage.' : '.'}</p>`;
+}
+
+/* ---------- Section 2: implied volatility ---------- */
+
+function renderIV() {
+  const p = { ...mkt(), K: state.K };
+  const res = impliedVol(state.ivPrice, p, state.type);
+  const out = $('iv-result');
+  const note = $('iv-note');
+  const fl = bsmPrice({ ...p, sigma: 0 }, state.type);
+  const ceil = state.type === 'call' ? p.S * Math.exp(-p.q * p.T) : p.K * Math.exp(-p.r * p.T);
+  if (res.status === 'ok') {
+    out.textContent = `${(res.vol * 100).toFixed(2)}%`;
+    const how = res.method === 'newton' ? "Newton's method" : 'Newton with bisection fallback';
+    note.textContent = `${how}, ${res.iterations} iterations. The model price at this volatility is ${money(bsmPrice({ ...p, sigma: res.vol }, state.type), 4)}.`;
+  } else {
+    out.textContent = res.status === 'at-intrinsic' ? '0.00%' : 'No solution';
+    note.textContent = {
+      invalid: 'Enter a positive price and set days to expiry above zero.',
+      'below-intrinsic': `That price is below the lowest value this option can have (${money(fl, 4)}), so no volatility produces it.`,
+      'at-intrinsic': 'That price equals the zero-volatility value, so the implied volatility is zero.',
+      'above-max': `That price is above the highest value this option can have (${money(ceil, 4)}).`,
+    }[res.status] || 'The solver did not converge for this price.';
+  }
+  $('iv-apply').disabled = res.status !== 'ok';
+  $('iv-apply')._vol = res.vol;
+}
+
+/* ---------- Section 3: strategy builder ---------- */
+
+const legWord = (leg) => (leg.type === 'stock' ? 'share' : leg.type);
+
+function buildLegs() {
+  const ul = $('legs');
+  ul.innerHTML = '';
+  state.legs.forEach((leg, i) => {
+    const li = document.createElement('li');
+    li.className = 'leg';
+    li.innerHTML =
+      `<div class="cell"><label for="q-${i}">Quantity</label><input id="q-${i}" type="number" step="1" min="-20" max="20" value="${leg.qty}"></div>` +
+      `<div class="cell"><label for="t-${i}">Type</label><select id="t-${i}">` +
+      ['call', 'put', 'stock'].map((t) => `<option value="${t}"${t === leg.type ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('') + '</select></div>' +
+      '<div class="cell"><label>Position</label><span class="badge" data-badge></span></div>' +
+      '<div class="cell"><label>Entry price</label><span class="entry" data-entry></span></div>' +
+      `<div class="cell"><button type="button" class="btn ghost rm" aria-label="Remove leg ${i + 1}">Remove</button></div>` +
+      '<div class="wide" data-strike></div>';
+    ul.appendChild(li);
+    if (leg.type !== 'stock') {
+      makeField(li.querySelector('[data-strike]'), {
+        id: `k${i}`, label: `Strike, leg ${i + 1}`, min: 5, max: 400, step: 1, dec: 0, prefix: '$',
+        get: () => leg.strike,
+        set: (v) => { leg.strike = v; leg.premium = optPrice(leg, state.S); markCustom(); },
+      });
+    }
+    $(`q-${i}`).addEventListener('input', (e) => {
+      const v = Math.round(e.target.valueAsNumber);
+      if (!Number.isFinite(v)) return;
+      leg.qty = clamp(v, -20, 20);
+      markCustom();
+      update();
+    });
+    $(`t-${i}`).addEventListener('change', (e) => {
+      leg.type = e.target.value;
+      leg.strike = leg.type === 'stock' ? null : leg.strike || Math.round(state.S);
+      leg.premium = optPrice(leg, state.S);
+      markCustom();
+      buildLegs();
+      $(`t-${i}`).focus();
+      update();
+    });
+    li.querySelector('.rm').addEventListener('click', () => {
+      state.legs.splice(i, 1);
+      markCustom();
+      buildLegs();
+      $('add-leg').focus();
+      update();
+    });
+  });
+}
+
+function markCustom() {
+  state.preset = null;
+  document.querySelectorAll('.preset').forEach((b) => b.setAttribute('aria-pressed', 'false'));
+  $('preset-blurb').textContent = 'Custom position. Edit the legs below or pick a preset to start over.';
+}
+
+function applyPreset(id) {
+  state.preset = id;
+  state.legs = presetLegs(id, mkt());
+  document.querySelectorAll('.preset').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.id === id)));
+  $('preset-blurb').textContent = PRESETS.find((p) => p.id === id).blurb;
+  buildLegs();
+  update();
+}
+
+function renderStrategy() {
+  const legs = state.legs;
+  const M = mkt();
+  document.querySelectorAll('#legs .leg').forEach((li, i) => {
+    const leg = legs[i];
+    if (!leg) return;
+    const n = Math.abs(leg.qty);
+    const side = leg.qty > 0 ? 'Long' : leg.qty < 0 ? 'Short' : 'Flat';
+    const b = li.querySelector('[data-badge]');
+    b.textContent = leg.qty === 0 ? 'Flat (no effect)' : `${side} ${n} ${legWord(leg)}${n > 1 ? 's' : ''}`;
+    b.className = `badge ${leg.qty > 0 ? 'long' : leg.qty < 0 ? 'short' : ''}`;
+    li.querySelector('[data-entry]').textContent = money(leg.premium);
+  });
+
+  const a = analyze(legs);
+  const ng = netGreeks(legs, state.S, M);
+  const nowPnL = todayPnL(legs, state.S, M);
+  const cls = (v) => (v > 0.005 ? 'pos' : v < -0.005 ? 'neg' : '');
+  const box = (name, val, klass = '', extra = '') => `<div><dt>${name}</dt><dd class="${klass}">${val}${extra ? `<small>${extra}</small>` : ''}</dd></div>`;
+  const cost = a.netCost;
+  $('stats').innerHTML = !legs.length ? '' :
+    box('Max profit', a.unboundedProfit ? 'Unlimited' : money(a.maxProfit), cls(a.maxProfit)) +
+    box('Max loss', a.unboundedLoss ? 'Unlimited' : money(a.maxLoss), cls(a.maxLoss)) +
+    box('Breakeven', a.breakevens.length ? a.breakevens.map((b) => money(b)).join(', ') : 'None', '', 'at expiry') +
+    box(cost >= 0 ? 'Net debit' : 'Net credit', money(Math.abs(cost)), '', `${money(Math.abs(cost) * 100, 0)} per 100 shares`) +
+    box('P&L now', smoney(nowPnL), cls(nowPnL), 'at current inputs') +
+    box('Net delta', fix(ng.delta, 3)) +
+    box('Net theta / day', smoney(ng.theta, 3)) +
+    box('Net vega', smoney(ng.vega, 3), '', 'per vol point');
+
+  const strikes = [...new Set(legs.filter((l) => l.type !== 'stock').map((l) => l.strike))].sort((x, y) => x - y);
+  const keys = [state.S, ...strikes];
+  const mn = Math.min(...keys);
+  const mx = Math.max(...keys);
+  const span = Math.max(mx - mn, 0.25 * state.S);
+  const lo = Math.max(0, mn - span);
+  const hi = mx + span;
+  const fmtBE = a.breakevens.length ? `breakeven ${a.breakevens.map((b) => b.toFixed(2)).join(' and ')}` : 'no breakeven';
+  drawChart($('chart-payoff'), {
+    x: [lo, hi],
+    zero: true,
+    fillIdx: 0,
+    series: [
+      { cls: 's-expiry', f: (ST) => expiryPnL(legs, ST), n: 200, extra: strikes },
+      { cls: 's-today', f: (S) => todayPnL(legs, S, M), n: 160 },
+    ],
+    vlines: [{ x: state.S, cls: 'm-spot', label: 'Spot' }, ...strikes.map((x) => ({ x, cls: 'm-strike' }))],
+    dots: a.breakevens.map((x) => ({ x, y: 0 })),
+    defaultX: state.S,
+    readout: (x) => (legs.length
+      ? `Underlying ${x.toFixed(2)}: expiry ${smoney(expiryPnL(legs, x))}, today ${smoney(todayPnL(legs, x, M))} per share`
+      : 'Add a leg to see a payoff.'),
+    label: legs.length
+      ? `Profit and loss versus price of the underlying. Max profit ${a.unboundedProfit ? 'unlimited' : money(a.maxProfit)}, max loss ${a.unboundedLoss ? 'unlimited' : money(a.maxLoss)}, ${fmtBE}.`
+      : 'Empty strategy.',
+  });
+}
+
+/* ---------- Wiring ---------- */
+
+let queued = false;
+function update() {
+  if (queued) return;
+  queued = true;
+  requestAnimationFrame(() => {
+    queued = false;
+    renderPricer();
+    renderIV();
+    renderStrategy();
+  });
+}
+
+function init() {
+  const mf = $('market-fields');
+  const spec = [
+    { id: 'S', label: 'Spot price', min: 20, max: 300, step: 0.5, dec: 2, prefix: '$', get: () => state.S, set: (v) => (state.S = v) },
+    { id: 'sigma', label: 'Volatility', min: 1, max: 150, step: 0.5, dec: 1, scale: 100, unit: '%', get: () => state.sigma, set: (v) => (state.sigma = v) },
+    { id: 'r', label: 'Risk-free rate', min: -2, max: 15, step: 0.05, dec: 2, scale: 100, unit: '%', get: () => state.r, set: (v) => (state.r = v) },
+    { id: 'q', label: 'Dividend yield', min: 0, max: 10, step: 0.05, dec: 2, scale: 100, unit: '%', get: () => state.q, set: (v) => (state.q = v) },
+    { id: 'days', label: 'Days to expiry', min: 0, max: 730, step: 1, dec: 0, get: () => state.days, set: (v) => (state.days = Math.round(v)) },
+  ];
+  spec.forEach((s) => topFields.push(makeField(mf, s)));
+  topFields.push(makeField($('strike-field'), { id: 'K', label: 'Strike price', min: 10, max: 400, step: 1, dec: 0, prefix: '$', get: () => state.K, set: (v) => (state.K = v) }));
+
+  document.querySelectorAll('input[name="otype"]').forEach((r) => r.addEventListener('change', () => { state.type = r.value; update(); }));
+  $('greek-seg').insertAdjacentHTML('beforeend', GREEKS.map((d) =>
+    `<label><input type="radio" name="greek" value="${d.k}"${d.k === state.greek ? ' checked' : ''}><span>${d.name}</span></label>`).join(''));
+  document.querySelectorAll('input[name="greek"]').forEach((r) => r.addEventListener('change', () => { state.greek = r.value; update(); }));
+
+  $('iv-price').addEventListener('input', (e) => { state.ivPrice = e.target.valueAsNumber; update(); });
+  $('iv-apply').addEventListener('click', (e) => {
+    state.sigma = clamp(e.currentTarget._vol, 0.01, 1.5);
+    topFields.forEach((f) => f.show());
+    update();
+  });
+
+  $('presets').innerHTML = PRESETS.map((p) => `<button type="button" class="preset" data-id="${p.id}" aria-pressed="false">${p.name}</button>`).join('');
+  document.querySelectorAll('.preset').forEach((b) => b.addEventListener('click', () => applyPreset(b.dataset.id)));
+  $('add-leg').addEventListener('click', () => {
+    state.legs.push(makeLeg('call', Math.round(state.S), 1, mkt()));
+    markCustom();
+    buildLegs();
+    update();
+    $(`q-${state.legs.length - 1}`).focus();
+  });
+  $('reprice').addEventListener('click', () => {
+    state.legs.forEach((l) => { l.premium = optPrice(l, state.S); });
+    update();
+  });
+  $('reset').addEventListener('click', () => {
+    Object.assign(state, DEFAULTS);
+    topFields.forEach((f) => f.show());
+    document.querySelector('input[name="otype"][value="call"]').checked = true;
+    document.querySelector('input[name="greek"][value="delta"]').checked = true;
+    $('iv-price').value = DEFAULTS.ivPrice;
+    applyPreset(DEFAULTS.preset);
+  });
+
+  ['chart-greek', 'chart-payoff'].forEach((id) => {
+    const el = $(id);
+    el.dataset.readout = id.replace('chart', 'readout');
+    el.setAttribute('aria-describedby', el.dataset.readout);
+    initChart(el);
+  });
+  window.addEventListener('resize', update);
+  $('iv-price').value = state.ivPrice;
+  applyPreset(state.preset);
+}
+
+init();

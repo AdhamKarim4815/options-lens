@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Options Lens</title>
+<meta name="description" content="Price options, read the Greeks, solve implied volatility and see strategy payoffs. Runs offline in your browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2317202b'/%3E%3Cpath d='M4 24h12l12-16' fill='none' stroke='%23ff7a5c' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="src/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <h1 class="brand">
+      <svg class="logo" viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
+        <circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M6 21h10l9-10" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
+      Options Lens
+    </h1>
+    <p class="tagline">Move a slider, watch the price, the risk and the payoff move with it.</p>
+  </div>
+</header>
+
+<noscript><p class="wrap nojs">Options Lens needs JavaScript to run its calculations. Nothing is sent anywhere.</p></noscript>
+
+<div class="wrap layout">
+  <aside class="rail" aria-labelledby="h-market">
+    <section class="card">
+      <h2 id="h-market"><span class="no">00</span> Market</h2>
+      <div id="market-fields"></div>
+      <button type="button" class="btn ghost" id="reset">Reset to defaults</button>
+      <p class="fine">All inputs stay in your browser. Time is measured in calendar days (365 per year).</p>
+    </section>
+  </aside>
+
+  <main id="main">
+    <section class="card" aria-labelledby="h-price">
+      <h2 id="h-price"><span class="no">01</span> Price and Greeks</h2>
+      <div class="controls">
+        <fieldset class="seg" id="type-seg">
+          <legend>Option type</legend>
+          <label><input type="radio" name="otype" value="call" checked><span>Call</span></label>
+          <label><input type="radio" name="otype" value="put"><span>Put</span></label>
+        </fieldset>
+        <div id="strike-field"></div>
+      </div>
+
+      <div class="hero" aria-live="polite">
+        <div>
+          <p class="eyebrow" id="price-label">European call</p>
+          <p class="price" id="price-main">0.00</p>
+        </div>
+        <dl class="split">
+          <div><dt>Call</dt><dd id="price-call">0.00</dd></div>
+          <div><dt>Put</dt><dd id="price-put">0.00</dd></div>
+          <div><dt>Intrinsic</dt><dd id="price-intr">0.00</dd></div>
+          <div><dt>Time value</dt><dd id="price-time">0.00</dd></div>
+        </dl>
+      </div>
+
+      <dl class="greeks" id="greeks"></dl>
+
+      <h3>Greeks versus spot</h3>
+      <fieldset class="seg small" id="greek-seg">
+        <legend>Greek to plot</legend>
+      </fieldset>
+      <div class="chart" id="chart-greek" tabindex="0" role="img" aria-label="Greek versus spot price chart"></div>
+      <p class="readout" id="readout-greek"></p>
+      <p class="fine">Left and right arrow keys move the cursor when the chart has focus.</p>
+
+      <h3>Put-call parity check</h3>
+      <div class="parity" id="parity"></div>
+    </section>
+
+    <section class="card" aria-labelledby="h-iv">
+      <h2 id="h-iv"><span class="no">02</span> Implied volatility</h2>
+      <p class="lede">Enter a market price for the option chosen above (same type and strike) and the solver finds the volatility that makes the model agree.</p>
+      <div class="iv-grid">
+        <div class="field">
+          <div class="field-head">
+            <label for="iv-price">Market price</label>
+            <span class="num"><span class="unit">$</span><input id="iv-price" type="number" inputmode="decimal" min="0" step="0.01" value="5.00"></span>
+          </div>
+        </div>
+        <div class="iv-out" aria-live="polite">
+          <p class="eyebrow">Implied volatility</p>
+          <p class="price" id="iv-result">-</p>
+          <p class="fine" id="iv-note"></p>
+        </div>
+      </div>
+      <button type="button" class="btn" id="iv-apply">Use this volatility</button>
+    </section>
+
+    <section class="card" aria-labelledby="h-strat">
+      <h2 id="h-strat"><span class="no">03</span> Strategy builder</h2>
+      <div class="presets" id="presets" role="group" aria-label="Strategy presets"></div>
+      <p class="lede" id="preset-blurb"></p>
+
+      <ul class="legs" id="legs" aria-label="Strategy legs"></ul>
+      <div class="btn-row">
+        <button type="button" class="btn ghost" id="add-leg">Add leg</button>
+        <button type="button" class="btn ghost" id="reprice">Reprice entry at current inputs</button>
+      </div>
+      <p class="fine">Entry premiums are locked when a leg is set. Move spot, volatility or time to see how the position responds, then reprice to start fresh.</p>
+
+      <dl class="stats" id="stats"></dl>
+
+      <div class="chart" id="chart-payoff" tabindex="0" role="img" aria-label="Strategy payoff chart"></div>
+      <p class="readout" id="readout-payoff"></p>
+      <ul class="legend" aria-label="Chart legend">
+        <li><svg width="30" height="10" aria-hidden="true"><line x1="0" y1="5" x2="30" y2="5" class="k-expiry"/></svg>At expiry</li>
+        <li><svg width="30" height="10" aria-hidden="true"><line x1="0" y1="5" x2="30" y2="5" class="k-today"/></svg>Today (theoretical)</li>
+        <li><svg width="30" height="10" aria-hidden="true"><line x1="15" y1="0" x2="15" y2="10" class="k-spot"/></svg>Spot</li>
+        <li><svg width="30" height="10" aria-hidden="true"><circle cx="15" cy="5" r="4" class="k-be"/></svg>Breakeven</li>
+      </ul>
+    </section>
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="wrap">
+    <p><strong>Educational use only.</strong> Black-Scholes-Merton assumes European exercise, constant volatility and rates, and no transaction costs. Real options differ. Nothing here is investment advice.</p>
+    <p>Built by Adham Karim. MIT licensed. <a href="https://github.com/adhamkarim4815/options-lens">Source on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script>
+  // Browsers block ES module scripts on file://, so a plain-script bundle of the
+  // same source (src/app.classic.js, see scripts/bundle.mjs) is used there.
+  (function () {
+    var s = document.createElement('script');
+    if (location.protocol === 'file:') {
+      s.src = 'src/app.classic.js';
+    } else {
+      s.type = 'module';
+      s.src = 'src/app.js';
+    }
+    document.body.appendChild(s);
+  })();
+</script>
+</body>
+</html>
