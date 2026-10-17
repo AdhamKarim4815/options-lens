@@ -4,6 +4,8 @@ Price a European option, read its Greeks in plain English, solve implied volatil
 
 ![Options Lens showing a bull call spread: price, Greeks, a Greeks-versus-spot chart, implied volatility and a payoff diagram](docs/screenshot.png)
 
+**[Live demo](https://adhamkarim4815.github.io/options-lens/)**
+
 ## Live demo
 
 Enable GitHub Pages for your copy of the repo (Settings, Pages, deploy from branch `main`, root folder). The app is then served at:
